@@ -76,8 +76,91 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 		PromoCode:    order.PromoCode,
 	}
 
+	// Проверка промокода
+	var promoCfg *factory.PromoConfig
+	var promoObj *discounts.PromoCode
+	if ctx.PromoCode != nil {
+		if cfg, ok := factory.FindPromo(e.config, *ctx.PromoCode); ok {
+			if cfg.Active && (cfg.ValidUntil == nil || !order.CreatedAt.After(*cfg.ValidUntil)) {
+				ctx.PromoValid = true
+				promoCfg = cfg
+				promoObj, _ = factory.CreatePromo(*cfg)
+			}
+		}
+	}
+
 	// 2. ThreeForTwo
 	for _, d := range e.strategies.threeForTwo {
+		if ad, ok := d.Apply(ctx); ok {
+			ctx.Applied = append(ctx.Applied, ad)
+		}
+	}
+
+	// 3. Percent — с парой "обычные процентные vs процентный промокод"
+	var pairCandidates []discounts.Discount
+	var outsidePair []discounts.Discount
+	for _, d := range e.strategies.percent {
+		if d.Kind() == discounts.KindPercent {
+			pairCandidates = append(pairCandidates, d)
+		} else {
+			outsidePair = append(outsidePair, d)
+		}
+	}
+
+	// Симуляция обычных процентных на копии контекста.
+	simReg := *ctx
+	simReg.Applied = append([]models.AppliedDiscount(nil), ctx.Applied...)
+	for _, d := range pairCandidates {
+		d.Apply(&simReg)
+	}
+	savedRegular := ctx.ItemsTotal - simReg.ItemsTotal
+
+	// Симуляция процентного промокода (если он валиден и процентный).
+	var savedPromo int64
+	if ctx.PromoValid && promoCfg.Type == "percent" {
+		simPromo := *ctx
+		simPromo.Applied = append([]models.AppliedDiscount(nil), ctx.Applied...)
+		promoObj.Apply(&simPromo)
+		savedPromo = ctx.ItemsTotal - simPromo.ItemsTotal
+	}
+
+	// Выбор победителя: больше выгода; при равенстве — промокод.
+	if savedPromo > 0 && savedPromo >= savedRegular {
+		if ad, ok := promoObj.Apply(ctx); ok {
+			ctx.Applied = append(ctx.Applied, ad)
+			ctx.PromoApplied = true
+		}
+	} else {
+		for _, d := range pairCandidates {
+			if ad, ok := d.Apply(ctx); ok {
+				ctx.Applied = append(ctx.Applied, ad)
+			}
+		}
+	}
+
+	// Лояльность и первый заказ — вне пары, после неё.
+	for _, d := range outsidePair {
+		if ad, ok := d.Apply(ctx); ok {
+			ctx.Applied = append(ctx.Applied, ad)
+		}
+	}
+
+	//4. Fixed
+	for _, d := range e.strategies.fixed {
+		if ad, ok := d.Apply(ctx); ok {
+			ctx.Applied = append(ctx.Applied, ad)
+		}
+	}
+	// Фикс-промокод — на стадии Fixed, после обычных.
+	if ctx.PromoValid && promoCfg.Type == "fixed" && !ctx.PromoApplied {
+		if ad, ok := promoObj.Apply(ctx); ok {
+			ctx.Applied = append(ctx.Applied, ad)
+			ctx.PromoApplied = true
+		}
+	}
+
+	// 5. Delivery
+	for _, d := range e.strategies.delivery {
 		if ad, ok := d.Apply(ctx); ok {
 			ctx.Applied = append(ctx.Applied, ad)
 		}
