@@ -11,6 +11,8 @@ var (
 	instance *ConfigProvider
 )
 
+// ConfigProvider хранит только конфиг. Состояние заказа сюда не кладём —
+// иначе заказы начнут мешать друг другу.
 type ConfigProvider struct {
 	mu     sync.RWMutex
 	config factory.Config
@@ -30,6 +32,7 @@ func (p *ConfigProvider) SetConfig(cfg factory.Config) {
 }
 
 func (p *ConfigProvider) GetConfig() factory.Config {
+	// RLock, а не Lock — читателей много, они не должны блокировать друг друга.
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.config

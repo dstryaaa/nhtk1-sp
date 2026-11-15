@@ -7,8 +7,6 @@ import (
 	"github.com/dstryaaa/nhtk1/internal/discounts"
 )
 
-// DiscountConfig — одна запись конфигурации скидки.
-// Поля опциональны: какие нужны — зависит от Type.
 type DiscountConfig struct {
 	Type      string `json:"type"`
 	Name      string `json:"name"`
@@ -19,7 +17,6 @@ type DiscountConfig struct {
 	Days      int    `json:"days"`
 }
 
-// PromoConfig — запись конфигурации промокода.
 type PromoConfig struct {
 	Code       string     `json:"code"`
 	Name       string     `json:"name"`
@@ -30,13 +27,12 @@ type PromoConfig struct {
 	Active     bool       `json:"active"`
 }
 
-// Config - полная конфигурация
 type Config struct {
 	Discounts  []DiscountConfig `json:"discounts"`
 	PromoCodes []PromoConfig    `json:"promo_codes"`
 }
 
-// Create создаёт стратегию по типу
+// Create — единственное место, где по Type решается, какой класс создавать.
 func Create(cfg DiscountConfig) (discounts.Discount, error) {
 	switch cfg.Type {
 	case "percent":
@@ -56,13 +52,15 @@ func Create(cfg DiscountConfig) (discounts.Discount, error) {
 	}
 }
 
-// CreatePromo создаёт промокод по конфигу.
+// CreatePromo возвращает *PromoCode: движку нужны Code/ValidUntil/Active
+// для проверки валидности до применения.
 func CreatePromo(cfg PromoConfig) (*discounts.PromoCode, error) {
 	var inner discounts.Discount
 	switch cfg.Type {
 	case "percent":
 		inner = discounts.NewPercentDiscount(cfg.Name, cfg.Percent)
 	case "fixed":
+		// У промокода нет порога — 0, чтобы срабатывал всегда.
 		inner = discounts.NewFixedDiscount(cfg.Value, 0, cfg.Name)
 	default:
 		return nil, fmt.Errorf("unknown promocode type: %q", cfg.Type)
@@ -70,7 +68,7 @@ func CreatePromo(cfg PromoConfig) (*discounts.PromoCode, error) {
 	return discounts.NewPromoCode(cfg.Name, cfg.Code, cfg.ValidUntil, cfg.Active, inner), nil
 }
 
-// FindPromo ищет промокод по коду в конфиге.
+// FindPromo ищет промокод по коду. Конфиг не мутируем — указатель на элемент безопасен.
 func FindPromo(cfg Config, code string) (*PromoConfig, bool) {
 	for i := range cfg.PromoCodes {
 		if cfg.PromoCodes[i].Code == code {

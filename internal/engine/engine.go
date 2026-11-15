@@ -40,6 +40,7 @@ func NewPricingEngine(config factory.Config) (*PricingEngine, error) {
 		case discounts.KindThreeForTwo:
 			s.threeForTwo = append(s.threeForTwo, d)
 		case discounts.KindPercent, discounts.KindLoyalty, discounts.KindFirstOrder:
+			// Все три процентные — одна стадия, порядок из конфига.
 			s.percent = append(s.percent, d)
 		case discounts.KindFixed:
 			s.fixed = append(s.fixed, d)
@@ -49,23 +50,19 @@ func NewPricingEngine(config factory.Config) (*PricingEngine, error) {
 			return nil, fmt.Errorf("unsupported kind: %v", d.Kind())
 		}
 	}
-	return &PricingEngine{
-		config:     config,
-		strategies: s,
-	}, nil
+	return &PricingEngine{config: config, strategies: s}, nil
 }
 
 func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, error) {
 	if order == nil {
 		return nil, fmt.Errorf("отсутствует заказ")
 	}
-
 	for _, item := range order.Items {
 		if item.Quantity <= 0 {
 			return nil, fmt.Errorf("некорректное quantity: %d", item.Quantity)
 		}
 	}
-	// 1. Начальное состояние контекста.
+
 	itemsSum := sumItems(order.Items)
 
 	ctx := &models.DiscountContext{
@@ -76,11 +73,13 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 		PromoCode:    order.PromoCode,
 	}
 
-	// Проверка промокода
+	// Промокод ищем заранее: движку нужно знать до стадии процентов,
+	// участвует ли он в паре с обычной процентной скидкой.
 	var promoCfg *factory.PromoConfig
 	var promoObj *discounts.PromoCode
 	if ctx.PromoCode != nil {
 		if cfg, ok := factory.FindPromo(e.config, *ctx.PromoCode); ok {
+			// Срок включителен: !After значит «не позже дня окончания».
 			if cfg.Active && (cfg.ValidUntil == nil || !order.CreatedAt.After(*cfg.ValidUntil)) {
 				ctx.PromoValid = true
 				promoCfg = cfg
@@ -89,14 +88,14 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 		}
 	}
 
-	// 2. ThreeForTwo
 	for _, d := range e.strategies.threeForTwo {
 		if ad, ok := d.Apply(ctx); ok {
 			ctx.Applied = append(ctx.Applied, ad)
 		}
 	}
 
-	// 3. Percent — с парой "обычные процентные vs процентный промокод"
+	// Percent: обычные процентные конкурируют с процентным промокодом,
+	// лояльность и первый заказ с ним не конфликтуют.
 	var pairCandidates []discounts.Discount
 	var outsidePair []discounts.Discount
 	for _, d := range e.strategies.percent {
@@ -107,7 +106,8 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 		}
 	}
 
-	// Симуляция обычных процентных на копии контекста.
+	// Симуляция на копии: Applied копируем отдельным слайсом,
+	// чтобы append не писал в общий backing array.
 	simReg := *ctx
 	simReg.Applied = append([]models.AppliedDiscount(nil), ctx.Applied...)
 	for _, d := range pairCandidates {
@@ -115,7 +115,6 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 	}
 	savedRegular := ctx.ItemsTotal - simReg.ItemsTotal
 
-	// Симуляция процентного промокода (если он валиден и процентный).
 	var savedPromo int64
 	if ctx.PromoValid && promoCfg.Type == "percent" {
 		simPromo := *ctx
@@ -124,7 +123,7 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 		savedPromo = ctx.ItemsTotal - simPromo.ItemsTotal
 	}
 
-	// Выбор победителя: больше выгода; при равенстве — промокод.
+	// Кто выгоднее — тот и применяется. При равенстве выигрывает промокод.
 	if savedPromo > 0 && savedPromo >= savedRegular {
 		if ad, ok := promoObj.Apply(ctx); ok {
 			ctx.Applied = append(ctx.Applied, ad)
@@ -138,20 +137,19 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 		}
 	}
 
-	// Лояльность и первый заказ — вне пары, после неё.
+	// Лояльность и первый заказ — после пары, от уже уменьшенной суммы.
 	for _, d := range outsidePair {
 		if ad, ok := d.Apply(ctx); ok {
 			ctx.Applied = append(ctx.Applied, ad)
 		}
 	}
 
-	//4. Fixed
 	for _, d := range e.strategies.fixed {
 		if ad, ok := d.Apply(ctx); ok {
 			ctx.Applied = append(ctx.Applied, ad)
 		}
 	}
-	// Фикс-промокод — на стадии Fixed, после обычных.
+	// Фикс-промокод — тоже здесь, после обычных фиксированных.
 	if ctx.PromoValid && promoCfg.Type == "fixed" && !ctx.PromoApplied {
 		if ad, ok := promoObj.Apply(ctx); ok {
 			ctx.Applied = append(ctx.Applied, ad)
@@ -159,7 +157,6 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 		}
 	}
 
-	// 5. Delivery
 	for _, d := range e.strategies.delivery {
 		if ad, ok := d.Apply(ctx); ok {
 			ctx.Applied = append(ctx.Applied, ad)
@@ -167,6 +164,7 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 	}
 
 	return &models.PricingResult{
+		// BaseTotal — «как было бы без скидок»: исходные товары + исходная доставка.
 		BaseTotal:        itemsSum + order.DeliveryCost,
 		AppliedDiscounts: ctx.Applied,
 		FinalTotal:       ctx.ItemsTotal + ctx.DeliveryCost,
@@ -174,7 +172,7 @@ func (e *PricingEngine) Calculate(order *models.Order) (*models.PricingResult, e
 }
 
 func sumItems(items []models.CartItem) int64 {
-	res := int64(0)
+	var res int64
 	for _, item := range items {
 		res += int64(item.Quantity) * item.Product.BasePrice
 	}
